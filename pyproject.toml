@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-security-scanner"
+version = "1.0.0"
+description = "🔐 AI Security Scanner — AST + AI 智能识别安全漏洞"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [{name = "AI Assistant", email = "ai@example.com"}]
+keywords = ["security", "scanner", "vulnerability", "ai", "static-analysis"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Topic :: Security",
+    "License :: OSI Approved :: MIT License",
+]
+dependencies = [
+    "openai>=1.0.0",
+    "click>=8.1.0",
+    "rich>=13.0.0",
+    "pydantic>=2.0.0",
+    "jinja2>=3.1.0",
+    "python-dotenv>=1.0.0",
+]
+[project.optional-dependencies]
+dev = ["pytest>=8.0.0"]
+
+[project.scripts]
+ai-scan = "cli.main:cli"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src/*", "cli/*"]
