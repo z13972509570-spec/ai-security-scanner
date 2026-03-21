@@ -1,3 +1,7 @@
+[![CI](https://github.com/z13972509570-spec/ai-security-scanner/actions/workflows/ci.yml/badge.svg)](https://github.com/z13972509570-spec/ai-security-scanner/actions)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://python.org)
+
 # 🔐 AI Security Scanner
 
 > 基于 AST 静态分析 + AI 智能识别的代码安全漏洞扫描工具，自动检测 SQL注入、XSS、CSRF、认证缺陷等安全风险，并生成修复代码
@@ -116,3 +120,6 @@ output:
 ## 📄 License
 
 MIT © 2026
+
+---
+版本: 1.0.0 | 许可证: MIT | 维护者: @z13972509570-spec
