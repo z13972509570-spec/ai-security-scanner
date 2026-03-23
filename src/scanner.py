@@ -1,157 +1,241 @@
-"""主扫描器 — 协调 AST 扫描和 AI 修复生成"""
-import time
-import os
+"""AST-based vulnerability scanner"""
+import ast
+import re
+import logging
 from pathlib import Path
-from typing import List, Optional, Literal
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from typing import List, Dict
 
-from .scanner import PythonScanner, JSScanner
-from .models import Vulnerability, ScanResult, Severity
+from .models import Vulnerability, Severity
 
 
-@dataclass
-class ScanConfig:
-    """扫描配置"""
-    extensions: List[str] = None
-    exclude_dirs: List[str] = None
-    max_file_size_kb: int = 1024
-    n_workers: int = 4
-    use_ai_fix: bool = True
-    ai_provider: Literal["openai", "anthropic", "ollama"] = "openai"
-    ai_model: str = "gpt-4o-mini"
-
-    def __post_init__(self):
-        self.extensions = self.extensions or ['.py', '.js', '.jsx', '.ts', '.tsx']
-        self.exclude_dirs = self.exclude_dirs or [
-            'node_modules', '__pycache__', '.git', 'venv', 'env',
-            '.venv', 'build', 'dist', '.eggs', '*.egg-info'
-        ]
+logger = logging.getLogger(__name__)
 
 
-class SecurityScanner:
-    """AI 安全扫描器主类"""
+# Security patterns for Python
+PYTHON_PATTERNS = {
+    "sql_injection": {
+        "pattern": r"execute\s*\(\s*['\"].*\+|f['\"].*\{.*\}.*execute",
+        "severity": Severity.CRITICAL,
+        "title": "SQL Injection Risk",
+        "description": "Possible SQL injection vulnerability detected"
+    },
+    "eval_usage": {
+        "pattern": r"\beval\s*\(",
+        "severity": Severity.HIGH,
+        "title": "Use of eval()",
+        "description": "eval() is dangerous and can execute arbitrary code"
+    },
+    "exec_usage": {
+        "pattern": r"\bexec\s*\(",
+        "severity": Severity.HIGH,
+        "title": "Use of exec()",
+        "description": "exec() is dangerous and can execute arbitrary code"
+    },
+    "hardcoded_password": {
+        "pattern": r"(password|passwd|pwd)\s*=\s*['\"][^'\"]+['\"]",
+        "severity": Severity.HIGH,
+        "title": "Hardcoded Password",
+        "description": "Hardcoded password detected in source code"
+    },
+    "hardcoded_secret": {
+        "pattern": r"(api_key|secret|token)\s*=\s*['\"][^'\"]+['\"]",
+        "severity": Severity.HIGH,
+        "title": "Hardcoded Secret",
+        "description": "Hardcoded API key, secret, or token detected"
+    },
+    "pickle_usage": {
+        "pattern": r"pickle\.loads?\s*\(",
+        "severity": Severity.HIGH,
+        "title": "Use of pickle",
+        "description": "pickle can execute arbitrary code during deserialization"
+    },
+    "subprocess_shell": {
+        "pattern": r"subprocess\..*shell\s*=\s*True",
+        "severity": Severity.MEDIUM,
+        "title": "Subprocess with shell=True",
+        "description": "shell=True can lead to shell injection vulnerabilities"
+    },
+    "insecure_hash": {
+        "pattern": r"hashlib\.(md5|sha1)\s*\(",
+        "severity": Severity.LOW,
+        "title": "Insecure Hash Function",
+        "description": "MD5/SHA1 are considered insecure for cryptographic purposes"
+    },
+}
 
-    def __init__(self, config: Optional[ScanConfig] = None):
-        self.config = config or ScanConfig()
-        self.py_scanner = PythonScanner()
-        self.js_scanner = JSScanner()
+# Security patterns for JavaScript
+JS_PATTERNS = {
+    "eval_usage": {
+        "pattern": r"\beval\s*\(",
+        "severity": Severity.HIGH,
+        "title": "Use of eval()",
+        "description": "eval() is dangerous and can execute arbitrary code"
+    },
+    "innerHTML": {
+        "pattern": r"\.innerHTML\s*=",
+        "severity": Severity.MEDIUM,
+        "title": "Use of innerHTML",
+        "description": "innerHTML can lead to XSS vulnerabilities"
+    },
+    "document_write": {
+        "pattern": r"document\.write\s*\(",
+        "severity": Severity.MEDIUM,
+        "title": "Use of document.write()",
+        "description": "document.write can lead to XSS vulnerabilities"
+    },
+    "hardcoded_secret": {
+        "pattern": r"(apiKey|api_key|secret|token|password)\s*[=:]\s*['\"][^'\"]+['\"]",
+        "severity": Severity.HIGH,
+        "title": "Hardcoded Secret",
+        "description": "Hardcoded API key, secret, or token detected"
+    },
+}
 
-    def scan(self, path: str) -> ScanResult:
-        """
-        扫描文件或目录
 
-        Args:
-            path: 文件或目录路径
-
-        Returns:
-            ScanResult: 扫描结果
-        """
-        start_time = time.time()
-        p = Path(path)
-
-        result = ScanResult()
-
-        if p.is_file():
-            files = [p]
-        elif p.is_dir():
-            files = self._collect_files(p)
-        else:
-            result.errors.append(f"路径不存在: {path}")
-            return result
-
-        result.scanned_files = len(files)
-
-        # 并发扫描
-        with ThreadPoolExecutor(max_workers=self.config.n_workers) as executor:
-            futures = {executor.submit(self._scan_file, f): f for f in files}
-            for future in as_completed(futures):
-                vulns = future.result()
-                result.vulnerabilities.extend(vulns)
-
-        result.scanned_lines = sum(
-            len(open(f, encoding='utf-8', errors='ignore').readlines())
-            for f in files if f.exists()
-        )
-        result.scan_time_seconds = time.time() - start_time
-
-        return result
-
-    def _collect_files(self, directory: Path) -> List[Path]:
-        """收集扫描文件"""
-        files = []
-        for ext in self.config.extensions:
-            for f in directory.rglob(f'*{ext}'):
-                # 排除目录
-                if any(ex in f.parts for ex in self.config.exclude_dirs):
-                    continue
-                # 排除大文件
-                if f.stat().st_size > self.config.max_file_size_kb * 1024:
-                    continue
-                files.append(f)
-        return files
-
-    def _scan_file(self, file_path: Path) -> List[Vulnerability]:
-        """扫描单个文件"""
-        if file_path.suffix == '.py':
-            return self.py_scanner.scan_file(file_path)
-        elif file_path.suffix in {'.js', '.jsx', '.ts', '.tsx'}:
-            return self.js_scanner.scan_file(file_path)
-        return []
-
-    def generate_fixes(self, vulns: List[Vulnerability]) -> List[str]:
-        """使用 AI 生成修复代码"""
-        fixes = []
-        for vuln in vulns:
-            fix = self._ai_fix(vuln)
-            fixes.append(fix)
-        return fixes
-
-    def _ai_fix(self, vuln: Vulnerability) -> str:
-        """调用 AI 生成单个漏洞的修复代码"""
-        from openai import OpenAI
-
-        prompt = f"""你是安全工程师。以下代码存在漏洞:
-
-文件: {vuln.file}:{vuln.line}
-漏洞: {vuln.title}
-描述: {vuln.description}
-问题代码:
-```
-{vuln.code_snippet}
-```
-
-请生成修复后的安全代码。仅输出代码，不要解释。"""
-
+class BaseScanner:
+    """Base scanner class"""
+    
+    def __init__(self):
+        self.logger = logger
+    
+    def _get_line_content(self, file_path: Path, line_number: int, context: int = 2) -> str:
+        """Get line content with context"""
         try:
-            client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
-            response = client.chat.completions.create(
-                model=self.config.ai_model,
-                messages=[
-                    {"role": "system", "content": "你是一个专业的安全工程师，输出仅包含修复代码。"},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.2,
-                max_tokens=500,
-            )
-            return response.choices[0].message.content.strip()
+            lines = open(file_path, encoding='utf-8', errors='ignore').readlines()
+            start = max(0, line_number - context - 1)
+            end = min(len(lines), line_number + context)
+            return ''.join(lines[start:end])
+        except Exception:
+            return ""
+
+
+class PythonScanner(BaseScanner):
+    """Python AST and regex scanner"""
+    
+    def scan_file(self, file_path: Path) -> List[Vulnerability]:
+        """Scan Python file
+        
+        Args:
+            file_path: Path to Python file
+            
+        Returns:
+            List of vulnerabilities
+        """
+        vulnerabilities = []
+        
+        try:
+            content = open(file_path, encoding='utf-8', errors='ignore').read()
+            lines = content.split('\n')
+            
+            for i, line in enumerate(lines, 1):
+                for rule_id, pattern_config in PYTHON_PATTERNS.items():
+                    if re.search(pattern_config["pattern"], line):
+                        vuln = Vulnerability(
+                            file=str(file_path),
+                            line=i,
+                            title=pattern_config["title"],
+                            description=pattern_config["description"],
+                            severity=pattern_config["severity"],
+                            code_snippet=line.strip(),
+                            rule_id=rule_id,
+                        )
+                        vulnerabilities.append(vuln)
+            
+            # AST-based checks
+            vulnerabilities.extend(self._ast_scan(file_path, content))
+            
         except Exception as e:
-            return f"# 修复失败: {e}"
+            self.logger.error(f"Error scanning {file_path}: {e}")
+        
+        return vulnerabilities
+    
+    def _ast_scan(self, file_path: Path, content: str) -> List[Vulnerability]:
+        """AST-based security scan"""
+        vulnerabilities = []
+        
+        try:
+            tree = ast.parse(content)
+            
+            for node in ast.walk(tree):
+                # Check for assert statements (can be disabled with -O)
+                if isinstance(node, ast.Assert):
+                    vulnerabilities.append(Vulnerability(
+                        file=str(file_path),
+                        line=node.lineno,
+                        title="Use of assert",
+                        description="assert statements can be disabled with -O flag",
+                        severity=Severity.LOW,
+                        code_snippet="assert ...",
+                        rule_id="assert_usage",
+                    ))
+                
+                # Check for bare except
+                if isinstance(node, ast.ExceptHandler) and node.type is None:
+                    vulnerabilities.append(Vulnerability(
+                        file=str(file_path),
+                        line=node.lineno,
+                        title="Bare except clause",
+                        description="Bare except catches all exceptions including KeyboardInterrupt",
+                        severity=Severity.LOW,
+                        code_snippet="except:",
+                        rule_id="bare_except",
+                    ))
+                
+                # Check for potential command injection in subprocess
+                if isinstance(node, ast.Call):
+                    if isinstance(node.func, ast.Attribute):
+                        if node.func.attr == 'call' or node.func.attr == 'run':
+                            for kw in node.keywords:
+                                if kw.arg == 'shell':
+                                    if isinstance(kw.value, ast.Constant) and kw.value.value:
+                                        vulnerabilities.append(Vulnerability(
+                                            file=str(file_path),
+                                            line=node.lineno,
+                                            title="Subprocess with shell=True",
+                                            description="shell=True can lead to shell injection",
+                                            severity=Severity.MEDIUM,
+                                            code_snippet="subprocess with shell=True",
+                                            rule_id="subprocess_shell",
+                                        ))
+        except SyntaxError:
+            pass
+        
+        return vulnerabilities
 
-    def apply_fixes(self, vulns: List[Vulnerability], fixes: List[str]) -> int:
-        """应用修复代码到源文件"""
-        applied = 0
-        for vuln, fix in zip(vulns, fixes):
-            if not fix or fix.startswith('#'):
-                continue
 
-            try:
-                lines = open(vuln.file, encoding='utf-8').readlines()
-                if 0 <= vuln.line - 1 < len(lines):
-                    lines[vuln.line - 1] = fix + '\n'
-                    open(vuln.file, 'w', encoding='utf-8').writelines(lines)
-                    applied += 1
-            except Exception:
-                pass
-
-        return applied
+class JSScanner(BaseScanner):
+    """JavaScript/TypeScript regex scanner"""
+    
+    def scan_file(self, file_path: Path) -> List[Vulnerability]:
+        """Scan JavaScript/TypeScript file
+        
+        Args:
+            file_path: Path to JS/TS file
+            
+        Returns:
+            List of vulnerabilities
+        """
+        vulnerabilities = []
+        
+        try:
+            content = open(file_path, encoding='utf-8', errors='ignore').read()
+            lines = content.split('\n')
+            
+            for i, line in enumerate(lines, 1):
+                for rule_id, pattern_config in JS_PATTERNS.items():
+                    if re.search(pattern_config["pattern"], line):
+                        vuln = Vulnerability(
+                            file=str(file_path),
+                            line=i,
+                            title=pattern_config["title"],
+                            description=pattern_config["description"],
+                            severity=pattern_config["severity"],
+                            code_snippet=line.strip(),
+                            rule_id=rule_id,
+                        )
+                        vulnerabilities.append(vuln)
+            
+        except Exception as e:
+            self.logger.error(f"Error scanning {file_path}: {e}")
+        
+        return vulnerabilities
